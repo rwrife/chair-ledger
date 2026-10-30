@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: git diff --exit-code
+      - run: dart format --output=none --set-exit-if-changed .
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build windows --release
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Android debug build in pinned Flutter container
+        run: |
+          docker run --name chair-ledger-android -v "$PWD:/app" -w /app --entrypoint /bin/bash gmeligio/flutter-android:3.47.2 -c '
+            set -e
+            export PATH="/home/flutter/sdks/flutter/bin:$PATH"
+            git config --global --add safe.directory /app
+            flutter pub get --enforce-lockfile
+            flutter build apk --debug
+          '
