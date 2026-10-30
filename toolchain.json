@@ -1,0 +1,18 @@
+{
+  "schema": "tool-lab/toolchain/v1",
+  "project": "chair-ledger",
+  "framework": "flutter",
+  "channel": "stable",
+  "status": "PLANNED - no Flutter project generated yet",
+  "application_id": "com.infinityball.chairledger",
+  "ios_bundle_identifier": "com.infinityball.chairledger",
+  "windows_identity_name": "cominfinityball.chairledger",
+  "asc_registration": "BLOCKED FORBIDDEN_ERROR.PLA_NOT_ACCEPTED (2026-10-30)",
+  "platforms_enabled": ["windows", "android", "ios"],
+  "tablet_support": "enabled",
+  "ux_strategy": "A-platform-native-adaptive",
+  "primary_ci_release_target": "windows-latest",
+  "mobile_ci": "flutter build apk --debug in Linux Docker; iOS compile later on macOS",
+  "icon": "AppStore/icon.png generated via OpenAI Images gpt-image-2.5-flare; platform wiring pending",
+  "network_policy": "none - app must perform no network requests"
+}
