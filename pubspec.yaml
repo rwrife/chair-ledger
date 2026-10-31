@@ -7,8 +7,11 @@ environment:
   sdk: ^3.13.2
 
 dependencies:
+  fluent_ui: ^4.17.0
   flutter:
     sdk: flutter
+  path_provider: ^2.1.6
+  sqlite3: ^3.8.0
 
 dev_dependencies:
   flutter_test:

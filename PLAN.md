@@ -24,7 +24,7 @@ Service(id, name, durationMinutes, bufferMinutes); WorkingWindow(day, open, clos
 
 ## Testing and toolchain
 
-Pure-Dart unit cases: adjacent intervals, buffers, cross-midnight rejection, status changes, restore rollback, malformed JSON, CSV formula injection. Widget/golden checks per TargetPlatform and size. `flutter test` and `flutter build windows --release` on Windows; Android debug build in pinned Docker Linux image. MacOS iOS compile evidence later. No Flutter application/tests/build exist in current documentation scaffold.
+Pure-Dart unit cases: adjacent intervals, buffers, cross-midnight rejection, status changes, restore rollback, malformed JSON, CSV formula injection. Widget/golden checks per TargetPlatform and size. `flutter test` and `flutter build windows --release` on Windows; Android debug build in pinned Docker Linux image. MacOS iOS compile evidence later. Flutter scaffold and service/slot/SQLite/entry-flow tests exist; Windows, Android, and iOS builds must pass CI/native gates before release.
 
 ## Risks and non-goals
 
