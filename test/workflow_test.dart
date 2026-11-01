@@ -61,7 +61,7 @@ void main() {
 
     // Appears in list
     expect(book.appointments.length, 1);
-    expect(find.textContaining('Sam Stylist'), findsOneWidget);
+    expect(find.text('09:30 · Sam Stylist'), findsOneWidget);
     expect(find.text('Haircut'), findsOneWidget);
     expect(find.text('booked'), findsOneWidget);
 
@@ -118,8 +118,8 @@ void main() {
     await tester.tap(find.byKey(const Key('save-appointment-button')));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('New Client'), findsOneWidget);
-    expect(find.textContaining('Existing Client'), findsOneWidget);
+    expect(find.text('11:00 · New Client'), findsOneWidget);
+    expect(find.text('10:00 · Existing Client'), findsOneWidget);
   });
 
   testWidgets('service and hours editor persists edits', (tester) async {
