@@ -1,11 +1,15 @@
 import 'dart:math';
+import 'dart:io';
+import 'dart:convert';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fluent_ui/fluent_ui.dart' as fluent;
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'book.dart';
 import 'schedule.dart';
@@ -49,6 +53,10 @@ class _ChairLedgerAppState extends State<ChairLedgerApp> {
   final close = TextEditingController(text: '17:00');
   String? serviceId;
   int? selectedWeekday;
+  BackupPreview? backupCandidate;
+  String? backupSource;
+  String? statusMessage;
+  bool redactExport = true;
 
   bool get ios => defaultTargetPlatform == TargetPlatform.iOS;
   bool get windows => defaultTargetPlatform == TargetPlatform.windows;
@@ -228,6 +236,125 @@ class _ChairLedgerAppState extends State<ChairLedgerApp> {
     }
   }
 
+  // Only user gestures open system file dialogs/shares. Never overwrite live data on parse failure.
+  Future<void> exportFile({required bool csv}) async {
+    try {
+      final name = csv ? 'chair-ledger-day.csv' : 'chair-ledger-backup.json';
+      final mime = csv ? 'text/csv' : 'application/json';
+      final content = csv
+          ? dailyScheduleCsv(book, day, redactNames: redactExport)
+          : book.exportJson();
+      final bytes = utf8.encode(content);
+
+      if (windows ||
+          defaultTargetPlatform == TargetPlatform.linux ||
+          defaultTargetPlatform == TargetPlatform.macOS) {
+        final location = await getSaveLocation(
+          suggestedName: name,
+          acceptedTypeGroups: [
+            XTypeGroup(
+              label: csv ? 'CSV schedule' : 'JSON backup',
+              extensions: [csv ? 'csv' : 'json'],
+            ),
+          ],
+        );
+        if (location == null) return;
+        final target = File(location.path);
+        final staging = File(
+          '${target.path}.chair-ledger-${DateTime.now().microsecondsSinceEpoch}.tmp',
+        );
+        try {
+          await staging.writeAsBytes(bytes, flush: true);
+          await staging.rename(target.path);
+        } finally {
+          if (await staging.exists()) await staging.delete();
+        }
+      } else {
+        // Mobile platform-authentic export: save to application cache and invoke share sheet.
+        final tempDir = await getTemporaryDirectory();
+        final exportDir = Directory('${tempDir.path}/exports');
+        if (!await exportDir.exists()) await exportDir.create(recursive: true);
+        final target = File('${exportDir.path}/$name');
+        await target.writeAsBytes(bytes, flush: true);
+        if (!mounted) return;
+        final box = context.findRenderObject() as RenderBox?;
+        final origin = box != null && box.hasSize
+            ? box.localToGlobal(Offset.zero) & box.size
+            : null;
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(target.path, mimeType: mime, name: name)],
+            sharePositionOrigin: origin,
+            subject: csv
+                ? 'Chair Ledger daily schedule'
+                : 'Chair Ledger backup',
+          ),
+        );
+      }
+      if (mounted) {
+        setState(() {
+          statusMessage = csv
+              ? 'Daily schedule exported. Protect exported file.'
+              : 'Backup exported. It contains private notes and client labels.';
+          error = null;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = 'Export failed: $e');
+    }
+  }
+
+  Future<void> selectBackup() async {
+    setState(() {
+      backupCandidate = null;
+      backupSource = null;
+    });
+    try {
+      final file = await openFile(
+        acceptedTypeGroups: [
+          const XTypeGroup(
+            label: 'JSON backup',
+            extensions: ['json'],
+            uniformTypeIdentifiers: ['public.json'],
+          ),
+        ],
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      if (bytes.length > 20 * 1024 * 1024) {
+        throw const FormatException('Backup exceeds 20 MB');
+      }
+      final candidate = previewBackup(utf8.decode(bytes));
+      if (mounted) {
+        setState(() {
+          backupCandidate = candidate;
+          backupSource = file.name;
+          error = null;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = 'Backup rejected: $e');
+    }
+  }
+
+  void confirmRestore() {
+    final candidate = backupCandidate;
+    if (candidate == null) return;
+    try {
+      book.restore(candidate);
+      setState(() {
+        backupCandidate = null;
+        backupSource = null;
+        selected = null;
+        editing = false;
+        statusMessage = 'Backup restored.';
+        error = null;
+      });
+    } catch (e) {
+      setState(() => error = 'Restore failed; existing book kept: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     const title = 'Chair Ledger';
@@ -282,24 +409,40 @@ class _ChairLedgerAppState extends State<ChairLedgerApp> {
                       }),
                       key: const Key('tab-services'),
                     ),
+                    button(
+                      'Export & restore',
+                      () => setState(() {
+                        tab = 2;
+                        editing = false;
+                      }),
+                      key: const Key('tab-export'),
+                    ),
                   ],
                 );
-                final message = error == null
-                    ? <Widget>[]
-                    : [
-                        Text(
-                          error!,
-                          style: const TextStyle(color: Color(0xffb00020)),
-                        ),
-                      ];
+                final message = [
+                  if (error != null)
+                    Text(
+                      error!,
+                      key: const Key('app-error-text'),
+                      style: const TextStyle(color: Color(0xffb00020)),
+                    ),
+                  if (statusMessage != null)
+                    Text(
+                      statusMessage!,
+                      key: const Key('app-status-text'),
+                      style: const TextStyle(color: Color(0xff00695c)),
+                    ),
+                ];
                 if (!wide || tab != 0) {
                   return pane([
                     navigation,
                     ...message,
                     if (tab == 0)
                       ...appointmentContent()
+                    else if (tab == 1)
+                      ...serviceContent()
                     else
-                      ...serviceContent(),
+                      ...exportContent(),
                   ]);
                 }
                 return Column(
@@ -641,6 +784,60 @@ class _ChairLedgerAppState extends State<ChairLedgerApp> {
         ),
       ],
     ),
+  ];
+
+  List<Widget> exportContent() => [
+    const Text('Private exports', style: TextStyle(fontSize: 22)),
+    const Text(
+      'Backups contain client labels and private notes. Keep files protected. '
+      'Restore replaces the entire current book after preview.',
+    ),
+    button(
+      'Export JSON backup',
+      () => exportFile(csv: false),
+      key: const Key('export-backup-button'),
+    ),
+    button(
+      'Export daily CSV',
+      () => exportFile(csv: true),
+      key: const Key('export-csv-button'),
+    ),
+    button(
+      redactExport
+          ? 'Client names: redacted (change)'
+          : 'Client names: included (change)',
+      () => setState(() => redactExport = !redactExport),
+      key: const Key('redact-names-button'),
+    ),
+    const Divider(),
+    button(
+      'Choose backup to preview',
+      selectBackup,
+      key: const Key('choose-backup-button'),
+    ),
+    if (backupCandidate != null) ...[
+      Text(
+        'Selected: $backupSource — ${backupCandidate!.summary}',
+        key: const Key('backup-preview-text'),
+      ),
+      const Text(
+        'Replace ALL existing services, hours, and appointments? '
+        'This cannot be undone unless you exported a separate backup.',
+      ),
+      button(
+        'Replace book with previewed backup',
+        confirmRestore,
+        key: const Key('confirm-restore-button'),
+      ),
+      button(
+        'Cancel restore',
+        () => setState(() {
+          backupCandidate = null;
+          backupSource = null;
+        }),
+        key: const Key('cancel-restore-button'),
+      ),
+    ],
   ];
 
   List<Widget> serviceContent() => [

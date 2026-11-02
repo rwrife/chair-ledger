@@ -1,6 +1,169 @@
+import 'dart:convert';
+
 import 'package:sqlite3/sqlite3.dart';
 
 import 'schedule.dart';
+
+/// Validated backup payload ready for an explicit, atomic restore.
+class BackupPreview {
+  const BackupPreview._(this.services, this.windows, this.appointments);
+  final List<Service> services;
+  final List<WorkingWindow> windows;
+  final List<Appointment> appointments;
+
+  String get summary =>
+      '${services.length} services, ${windows.length} working windows, '
+      '${appointments.length} appointments';
+}
+
+/// Reject malformed and unsupported backups before touching the live book.
+BackupPreview previewBackup(String source) {
+  final Object? decoded = jsonDecode(source);
+  if (decoded is! Map<String, dynamic> || decoded['version'] != 1) {
+    throw const FormatException('Unsupported backup version');
+  }
+  List<Map<String, dynamic>> rows(String key) {
+    final value = decoded[key];
+    if (value is! List) throw FormatException('Missing $key');
+    if (value.length > 10000) throw FormatException('Too many $key');
+    return value.map((row) {
+      if (row is! Map<String, dynamic>) throw FormatException('Invalid $key');
+      return row;
+    }).toList();
+  }
+
+  int number(Map<String, dynamic> row, String key) {
+    final value = row[key];
+    if (value is! int) throw FormatException('Invalid $key');
+    return value;
+  }
+
+  String text(Map<String, dynamic> row, String key) {
+    final value = row[key];
+    if (value is! String) throw FormatException('Invalid $key');
+    return value;
+  }
+
+  String? optional(Map<String, dynamic> row, String key) {
+    final value = row[key];
+    if (value != null && value is! String) {
+      throw FormatException('Invalid $key');
+    }
+    return value as String?;
+  }
+
+  DateTime localStart(Map<String, dynamic> row) {
+    final value = text(row, 'startLocal');
+    final match = RegExp(
+      r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):00(?:\.000)?$',
+    ).firstMatch(value);
+    if (match == null) throw const FormatException('Invalid local start');
+    return parseLocalMinute(
+      int.parse(match[1]!),
+      int.parse(match[2]!),
+      int.parse(match[3]!),
+      int.parse(match[4]!),
+      int.parse(match[5]!),
+    );
+  }
+
+  final services = [
+    for (final row in rows('services'))
+      Service(
+        id: text(row, 'id'),
+        name: text(row, 'name'),
+        durationMinutes: number(row, 'duration'),
+        bufferMinutes: number(row, 'buffer'),
+      ),
+  ];
+  final windows = [
+    for (final row in rows('windows'))
+      WorkingWindow(
+        weekday: number(row, 'weekday'),
+        openMinute: number(row, 'open'),
+        closeMinute: number(row, 'close'),
+      ),
+  ];
+  final appointments = [
+    for (final row in rows('appointments'))
+      Appointment(
+        id: text(row, 'id'),
+        serviceId: text(row, 'serviceId'),
+        startLocal: localStart(row),
+        durationMinutes: number(row, 'duration'),
+        bufferMinutes: number(row, 'buffer'),
+        clientLabel: optional(row, 'clientLabel'),
+        note: optional(row, 'note'),
+        status: BookingStatus.values.byName(text(row, 'status')),
+      ),
+  ];
+  if (services.map((s) => s.id).toSet().length != services.length ||
+      appointments.map((a) => a.id).toSet().length != appointments.length ||
+      windows.map((w) => '${w.weekday}:${w.openMinute}').toSet().length !=
+          windows.length) {
+    throw const FormatException('Duplicate backup ID or working window');
+  }
+  final serviceIds = services.map((s) => s.id).toSet();
+  for (final window in windows) {
+    if (windows.any(
+      (other) =>
+          !identical(window, other) &&
+          window.weekday == other.weekday &&
+          window.openMinute < other.closeMinute &&
+          other.openMinute < window.closeMinute,
+    )) {
+      throw const FormatException('Overlapping working windows');
+    }
+  }
+  for (final appointment in appointments) {
+    if (!serviceIds.contains(appointment.serviceId) ||
+        appointment.startLocal.isUtc ||
+        !isUniqueLocalMinute(appointment.startLocal) ||
+        validateSlot(
+              appointment,
+              windows,
+              appointments.where((a) => a.id != appointment.id),
+            ) !=
+            null) {
+      throw const FormatException('Invalid backup appointment');
+    }
+  }
+  return BackupPreview._(
+    List.unmodifiable(services),
+    List.unmodifiable(windows),
+    List.unmodifiable(appointments),
+  );
+}
+
+String dailyScheduleCsv(Book book, DateTime day, {required bool redactNames}) {
+  String cell(String value) {
+    final safe = RegExp(r'^[\s]*[=+\-@\t\r]').hasMatch(value)
+        ? "'$value"
+        : value;
+    return '"${safe.replaceAll('"', '""')}"';
+  }
+
+  final services = {for (final s in book.services) s.id: s.name};
+  final lines = <String>['Date,Time,Service,Client,Status'];
+  for (final a in book.appointments.where(
+    (a) =>
+        a.startLocal.year == day.year &&
+        a.startLocal.month == day.month &&
+        a.startLocal.day == day.day,
+  )) {
+    final start = a.startLocal;
+    lines.add(
+      [
+        '${start.year}-${start.month.toString().padLeft(2, '0')}-${start.day.toString().padLeft(2, '0')}',
+        '${start.hour.toString().padLeft(2, '0')}:${start.minute.toString().padLeft(2, '0')}',
+        services[a.serviceId]!,
+        redactNames ? 'Private client' : a.clientLabel ?? '',
+        a.status.name,
+      ].map(cell).join(','),
+    );
+  }
+  return '${lines.join('\r\n')}\r\n';
+}
 
 class SlotRejected implements Exception {
   const SlotRejected(this.reason);
@@ -210,5 +373,79 @@ class Book {
       status.name,
       id,
     ]);
+  });
+
+  String exportJson() => jsonEncode({
+    'version': 1,
+    'services': [
+      for (final s in services)
+        {
+          'id': s.id,
+          'name': s.name,
+          'duration': s.durationMinutes,
+          'buffer': s.bufferMinutes,
+        },
+    ],
+    'windows': [
+      for (final w in windows)
+        {'weekday': w.weekday, 'open': w.openMinute, 'close': w.closeMinute},
+    ],
+    'appointments': [
+      for (final a in appointments)
+        {
+          'id': a.id,
+          'serviceId': a.serviceId,
+          'startLocal':
+              '${a.startLocal.year.toString().padLeft(4, '0')}-'
+              '${a.startLocal.month.toString().padLeft(2, '0')}-'
+              '${a.startLocal.day.toString().padLeft(2, '0')}T'
+              '${a.startLocal.hour.toString().padLeft(2, '0')}:'
+              '${a.startLocal.minute.toString().padLeft(2, '0')}:00',
+          'duration': a.durationMinutes,
+          'buffer': a.bufferMinutes,
+          'clientLabel': a.clientLabel,
+          'note': a.note,
+          'status': a.status.name,
+        },
+    ],
+  });
+
+  void restore(BackupPreview backup) => _transaction(() {
+    _db.execute('DELETE FROM appointments');
+    _db.execute('DELETE FROM windows');
+    _db.execute('DELETE FROM services');
+    for (final s in backup.services) {
+      _db.execute(
+        'INSERT INTO services (id, name, duration, buffer) VALUES (?, ?, ?, ?)',
+        [s.id, s.name, s.durationMinutes, s.bufferMinutes],
+      );
+    }
+    for (final w in backup.windows) {
+      _db.execute(
+        'INSERT INTO windows (weekday, open_minute, close_minute) VALUES (?, ?, ?)',
+        [w.weekday, w.openMinute, w.closeMinute],
+      );
+    }
+    for (final a in backup.appointments) {
+      _db.execute(
+        '''INSERT INTO appointments
+        (id, service_id, year, month, day, hour, minute, duration, buffer, client_label, note, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        [
+          a.id,
+          a.serviceId,
+          a.startLocal.year,
+          a.startLocal.month,
+          a.startLocal.day,
+          a.startLocal.hour,
+          a.startLocal.minute,
+          a.durationMinutes,
+          a.bufferMinutes,
+          a.clientLabel,
+          a.note,
+          a.status.name,
+        ],
+      );
+    }
   });
 }
