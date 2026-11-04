@@ -1,0 +1,90 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to package
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: windows-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: Validate release tag and checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -cnotmatch '^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { throw 'Expected existing version tag vMAJOR.MINOR.PATCH' }
+          $sha = git rev-parse HEAD
+          $tagSha = git rev-parse --verify "refs/tags/$env:RELEASE_TAG^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $sha -ne $tagSha) { throw 'Checkout does not match release tag' }
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: git diff --exit-code
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build windows --release
+      - name: Package and smoke-test portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $source = Join-Path $PWD 'build/windows/x64/runner/Release'
+          $zip = Join-Path $env:RUNNER_TEMP "chair-ledger-windows-$env:RELEASE_TAG.zip"
+          foreach ($required in @('chair_ledger.exe', 'flutter_windows.dll', 'data/icudtl.dat')) {
+            if (-not (Test-Path (Join-Path $source $required) -PathType Leaf)) { throw "Missing $required" }
+          }
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($source, $zip)
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $actual = @{}
+            foreach ($entry in $archive.Entries) {
+              if ($entry.Name) { $actual[$entry.FullName.Replace('\', '/')] = $entry.Length }
+            }
+            $expected = @{}
+            foreach ($file in (Get-ChildItem $source -File -Recurse -Force)) {
+              $relative = [System.IO.Path]::GetRelativePath($source, $file.FullName).Replace('\', '/')
+              $expected[$relative] = $file.Length
+            }
+            if ($actual.Count -ne $expected.Count) { throw 'Archive file count mismatch' }
+            foreach ($path in $expected.Keys) {
+              if (-not $actual.ContainsKey($path) -or $actual[$path] -ne $expected[$path]) { throw "Archive mismatch: $path" }
+            }
+            if (-not ($actual.Keys | Where-Object { $_ -like 'data/flutter_assets/*' })) { throw 'Flutter assets missing' }
+          } finally { $archive.Dispose() }
+          "RELEASE_ZIP=$zip" >> $env:GITHUB_ENV
+          Write-Host "Verified $($expected.Count) archived files and Windows runtime"
+      - name: Publish GitHub release asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = $env:RELEASE_ZIP
+          gh release view $env:RELEASE_TAG --json id *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $zip --clobber
+          } else {
+            gh release create $env:RELEASE_TAG $zip --verify-tag --title $env:RELEASE_TAG --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed' }
+          $assetName = [System.IO.Path]::GetFileName($zip)
+          $assets = (gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json).assets
+          $match = @($assets | Where-Object { $_.name -eq $assetName -and $_.size -eq (Get-Item $zip).Length })
+          if ($LASTEXITCODE -ne 0 -or $match.Count -ne 1) { throw 'Published asset missing or wrong size' }
